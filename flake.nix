@@ -71,6 +71,8 @@
         # Build the actual crate
         rust-docs-mcp = cranelibNightly.buildPackage (commonArgs // {
           inherit cargoArtifacts;
+          # Ensure OpenSSL is available at runtime
+          runtimeDependencies = with pkgs; [ openssl ];
         });
       in {
         packages = {
