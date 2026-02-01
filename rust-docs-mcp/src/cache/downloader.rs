@@ -13,14 +13,12 @@ use crate::cache::utils::copy_directory_contents;
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use futures::StreamExt;
-use git2::{Cred, FetchOptions, RemoteCallbacks};
-use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tar::Archive;
-use zeroize::Zeroizing;
 
 /// Progress callback function type for reporting download/operation progress (0-100)
 pub type ProgressCallback = Arc<dyn Fn(u8) + Send + Sync>;
@@ -300,7 +298,7 @@ impl CrateDownloader {
         Ok(source_path)
     }
 
-    /// Download a crate from GitHub repository
+    /// Download a crate from GitHub repository using git CLI
     async fn download_from_github(
         &self,
         name: &str,
@@ -325,7 +323,6 @@ impl CrateDownloader {
                 name,
                 version
             );
-            // Wait for the other process to finish (simple polling)
             let start = std::time::Instant::now();
             while lock_path.exists()
                 && start.elapsed() < std::time::Duration::from_secs(LOCK_TIMEOUT_SECS)
@@ -333,7 +330,6 @@ impl CrateDownloader {
                 tokio::time::sleep(std::time::Duration::from_millis(LOCK_POLL_INTERVAL_MS)).await;
             }
 
-            // Check if it was successfully cached by the other process
             if self.storage.is_cached(name, version) {
                 tracing::info!("Crate {}-{} was cached by another process", name, version);
                 return self.storage.source_path(name, version);
@@ -346,7 +342,6 @@ impl CrateDownloader {
         }
         std::fs::write(&lock_path, "downloading").context("Failed to create lock file")?;
 
-        // Ensure lock file is removed on exit
         let _lock_guard = LockGuard {
             path: lock_path.clone(),
         };
@@ -365,71 +360,47 @@ impl CrateDownloader {
             fs::remove_dir_all(&temp_dir).context("Failed to clean temp directory")?;
         }
 
-        // Set up GitHub authentication if token is available
-        let github_token = env::var("GITHUB_TOKEN").ok().map(Zeroizing::new);
-        let has_token = github_token.is_some();
+        // Clone the repository using git CLI
+        let output = Command::new("git")
+            .args(["clone", "--depth", "1", repo_url])
+            .arg(&temp_dir)
+            .output()
+            .context("Failed to execute git clone")?;
 
-        // Configure git authentication callbacks
-        let mut fetch_options = FetchOptions::new();
-        let mut callbacks = RemoteCallbacks::new();
-
-        if let Some(token) = github_token {
-            tracing::debug!("Using GITHUB_TOKEN for authentication");
-            callbacks.credentials(move |_url, username_from_url, _allowed_types| {
-                Cred::userpass_plaintext(username_from_url.unwrap_or("git"), &token)
-            });
-        } else {
-            tracing::debug!("No GITHUB_TOKEN found, using unauthenticated access");
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to clone repository {repo_url}: {stderr}");
         }
 
-        fetch_options.remote_callbacks(callbacks);
-
-        // Clone the repository with authentication
-        let mut builder = git2::build::RepoBuilder::new();
-        builder.fetch_options(fetch_options);
-
-        let repo = builder
-            .clone(repo_url, &temp_dir)
-            .with_context(|| {
-                let mut msg = format!("Failed to clone repository: {repo_url}");
-                if !has_token && repo_url.contains("github.com") {
-                    msg.push_str("\nNote: Set GITHUB_TOKEN environment variable for private repositories and higher rate limits");
-                }
-                msg
-            })?;
-
-        // Checkout the specific branch or tag (version contains the branch/tag name)
-        // The version parameter here is actually the branch or tag name
+        // Checkout the specific branch or tag if not main/master
         if version != "main" && version != "master" {
-            // Validate git reference name to prevent potential issues
             if !Self::is_valid_git_ref(version) {
                 bail!("Invalid git reference name: {version}");
             }
 
-            // Try to checkout as a branch first
-            let refname = format!("refs/remotes/origin/{version}");
-            if let Ok(reference) = repo.find_reference(&refname) {
-                let oid = reference
-                    .target()
-                    .ok_or_else(|| anyhow::anyhow!("Reference has no target"))?;
-                repo.set_head_detached(oid)
-                    .with_context(|| format!("Failed to checkout branch: {version}"))?;
-                repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-                    .with_context(|| format!("Failed to checkout branch: {version}"))?;
-            } else {
-                // Try as a tag
-                let tag_ref = format!("refs/tags/{version}");
-                if let Ok(reference) = repo.find_reference(&tag_ref) {
-                    let oid = reference
-                        .target()
-                        .ok_or_else(|| anyhow::anyhow!("Reference has no target"))?;
-                    repo.set_head_detached(oid)
-                        .with_context(|| format!("Failed to checkout tag: {version}"))?;
-                    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-                        .with_context(|| format!("Failed to checkout tag: {version}"))?;
-                } else {
-                    bail!("Could not find branch or tag: {version}");
-                }
+            // Fetch the specific ref and checkout
+            let fetch_output = Command::new("git")
+                .args(["-C"])
+                .arg(&temp_dir)
+                .args(["fetch", "origin", version, "--depth", "1"])
+                .output()
+                .context("Failed to fetch git ref")?;
+
+            if !fetch_output.status.success() {
+                let stderr = String::from_utf8_lossy(&fetch_output.stderr);
+                bail!("Failed to fetch ref {version}: {stderr}");
+            }
+
+            let checkout_output = Command::new("git")
+                .args(["-C"])
+                .arg(&temp_dir)
+                .args(["checkout", "FETCH_HEAD"])
+                .output()
+                .context("Failed to checkout git ref")?;
+
+            if !checkout_output.status.success() {
+                let stderr = String::from_utf8_lossy(&checkout_output.stderr);
+                bail!("Failed to checkout ref {version}: {stderr}");
             }
         }
 

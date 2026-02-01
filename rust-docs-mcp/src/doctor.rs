@@ -34,6 +34,9 @@ pub async fn run_diagnostics(
     // Check nightly toolchain
     results.push(check_nightly_toolchain().await);
 
+    // Check rust-docs-json component
+    results.push(check_rust_docs_json_component().await);
+
     // Check rustdoc JSON capability
     results.push(check_rustdoc_json().await);
 
@@ -115,6 +118,45 @@ async fn check_nightly_toolchain() -> DiagnosticResult {
             "Nightly toolchain".to_string(),
             false,
             "rustup not found in PATH".to_string(),
+            true,
+        ),
+    }
+}
+
+async fn check_rust_docs_json_component() -> DiagnosticResult {
+    // Check if rust-docs-json component is installed for nightly
+    match Command::new("rustup")
+        .args(["+nightly", "component", "list", "--installed"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let components = String::from_utf8_lossy(&output.stdout);
+            if components.lines().any(|line| line.starts_with("rust-docs-json")) {
+                DiagnosticResult::new(
+                    "rust-docs-json component".to_string(),
+                    true,
+                    "installed".to_string(),
+                    true,
+                )
+            } else {
+                DiagnosticResult::new(
+                    "rust-docs-json component".to_string(),
+                    false,
+                    "not installed".to_string(),
+                    true,
+                )
+            }
+        }
+        Ok(_) => DiagnosticResult::new(
+            "rust-docs-json component".to_string(),
+            false,
+            "failed to list nightly components".to_string(),
+            true,
+        ),
+        Err(_) => DiagnosticResult::new(
+            "rust-docs-json component".to_string(),
+            false,
+            "rustup not found".to_string(),
             true,
         ),
     }
@@ -385,19 +427,6 @@ async fn check_optional_dependencies() -> DiagnosticResult {
         }
     }
 
-    // Check for GITHUB_TOKEN
-    match std::env::var("GITHUB_TOKEN") {
-        Ok(_) => {
-            messages.push("GITHUB_TOKEN set (enables authenticated GitHub access)".to_string());
-        }
-        Err(_) => {
-            messages.push(
-                "GITHUB_TOKEN not set (optional: enables private repos and higher rate limits)"
-                    .to_string(),
-            );
-        }
-    }
-
     // If no optional dependencies to check, return success
     if messages.is_empty() {
         messages.push("No optional dependencies to check".to_string());
@@ -468,11 +497,18 @@ pub fn print_results(results: &[DiagnosticResult]) {
                             "\nGit is required for repository operations. Please install Git from https://git-scm.com/"
                         );
                     }
+                    "rust-docs-json component" => {
+                        println!(
+                            "\nThe rust-docs-json component is required for generating documentation. Install with:"
+                        );
+                        println!("  rustup +nightly component add rust-docs-json");
+                    }
                     "Rustdoc JSON" => {
                         println!(
-                            "\nRustdoc JSON generation failed. Ensure nightly toolchain is properly installed:"
+                            "\nRustdoc JSON generation failed. Ensure nightly toolchain and rust-docs-json component are installed:"
                         );
                         println!("  rustup toolchain install nightly");
+                        println!("  rustup +nightly component add rust-docs-json");
                     }
                     "Network" => {
                         println!(
